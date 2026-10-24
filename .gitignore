@@ -1,7 +1,11 @@
-cookies.*
+*.bak
 *.mp3
 *.mp4
-__pycache__/
-*.bak
-part_*
 .env
+__pycache__/
+c2.txt
+cookies.*
+cookies.b64
+cookies.min.txt
+cookies.txt
+part_*
