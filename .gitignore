@@ -1,0 +1,7 @@
+cookies.*
+*.mp3
+*.mp4
+__pycache__/
+*.bak
+part_*
+.env
