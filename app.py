@@ -494,6 +494,13 @@ def extract_smart():
                 "quality": data.get("quality", "medium"),
                 "audio_format": data.get("audio_format", "m4a"),
                 "enhance": data.get("enhance", False)}
+        _yt = {}
+
+        def _yt_job():
+            _yt["url"] = _pick_youtube(query, trace)
+
+        _yt_t = threading.Thread(target=_yt_job, daemon=True)
+        _yt_t.start()
         sc = _pick_soundcloud(query, trace)
         if sc:
             r, code = _timed_extract(base, sc, "sc_extract", trace)
@@ -504,7 +511,8 @@ def extract_smart():
                 body["trace"] = trace
                 print("[smart]", trace)
                 return jsonify(body)
-        yt = _pick_youtube(query, trace)
+        _yt_t.join(timeout=40)
+        yt = _yt.get("url")
         if not yt:
             print("[smart]", trace)
             return jsonify({"error": "no results found for that query", "trace": trace}), 404
