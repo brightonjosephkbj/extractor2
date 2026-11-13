@@ -84,8 +84,14 @@ def enhance_audio(input_path, output_path):
         "volume=6dB,"
         "alimiter=limit=0.891:release=100"
     )
-    cmd = ["ffmpeg", "-y", "-i", input_path, "-af", af,
-           "-c:a", "libmp3lame", "-q:a", "2", output_path]
+    ext = output_path.rsplit(".", 1)[-1].lower()
+    if ext == "mp3":
+        codec = ["-c:a", "libmp3lame", "-q:a", "2"]
+    elif ext in ("webm", "opus", "ogg"):
+        codec = ["-c:a", "libopus", "-b:a", "160k"]
+    else:
+        codec = ["-c:a", "aac", "-b:a", "192k"]
+    cmd = ["ffmpeg", "-y", "-i", input_path, "-vn", "-af", af, *codec, output_path]
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
     if r.returncode != 0:
         raise RuntimeError(f"audio enhance failed: {r.stderr[-1000:]}")
@@ -252,9 +258,10 @@ def search():
         SEARCH_SLOTS.release()
 
 
-def _extract_work():
+def _extract_work(data=None):
 
-    data = request.get_json(silent=True) or {}
+    if data is None:
+        data = request.get_json(silent=True) or {}
     url = data.get("url")
     mode = data.get("mode", "audio")
     quality = data.get("quality", "medium")
@@ -270,7 +277,8 @@ def _extract_work():
     out_template = os.path.join(work_dir, "output.%(ext)s")
     info_json_path = os.path.join(work_dir, "output.info.json")
 
-    if mode == "audio":
+    audio_format = (data.get("audio_format") or "m4a").lower()
+    if mode == "audio" and audio_format == "mp3":
         bitrate = AUDIO_QUALITY_MAP.get(quality, "192")
         cmd = [
             "yt-dlp", "-x", "--audio-format", "mp3",
@@ -281,6 +289,15 @@ def _extract_work():
         expected_path = os.path.join(work_dir, "output.mp3")
         mimetype = "audio/mpeg"
         download_ext = "mp3"
+    elif mode == "audio":
+        cmd = [
+            "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
+            *cookie_args(work_dir), *YTDLP_POT_ARGS, *JS_RUNTIME_ARGS,
+            "--write-info-json", "-o", out_template, url,
+        ]
+        expected_path = None
+        mimetype = "audio/mp4"
+        download_ext = "m4a"
     else:
         height = VIDEO_QUALITY_MAP.get(quality, 720)
         fmt = f"bv*[height<={height}]+ba/b[height<={height}]/b"
@@ -303,7 +320,17 @@ def _extract_work():
         print(f"[extract] yt-dlp failed for mode={mode} url={url}: {result.stderr[-1000:]}")
         return jsonify({"error": "yt-dlp failed", "stderr": result.stderr[-2000:]}), 422
 
-    if not os.path.exists(expected_path):
+    if expected_path is None:
+        found = [f for f in os.listdir(work_dir)
+                 if f.startswith("output.") and not f.endswith((".json", ".part", ".ytdl"))]
+        if found:
+            expected_path = os.path.join(work_dir, found[0])
+            download_ext = found[0].rsplit(".", 1)[-1].lower()
+            mimetype = {"m4a": "audio/mp4", "mp4": "audio/mp4", "webm": "audio/webm",
+                        "opus": "audio/ogg", "ogg": "audio/ogg",
+                        "mp3": "audio/mpeg"}.get(download_ext, "application/octet-stream")
+
+    if not expected_path or not os.path.exists(expected_path):
         return jsonify({"error": f"extraction succeeded but {download_ext} not found"}), 500
 
     if data.get("enhance"):
@@ -346,10 +373,112 @@ def _extract_work():
 def extract():
     if not check_auth(request):
         return jsonify({"error": "unauthorized"}), 401
-    if not EXTRACT_SLOTS.acquire(blocking=False):
+    if not EXTRACT_SLOTS.acquire(timeout=60):
         return jsonify({"error": "server busy, try again shortly"}), 429
     try:
         return _extract_work()
+    finally:
+        EXTRACT_SLOTS.release()
+
+
+import re as _re
+
+_BAD_WORDS = ("remix", "sped up", "speed up", "slowed", "nightcore", "cover",
+              "mashup", "bass boosted", "8d", "reverb", "karaoke",
+              "instrumental", "live")
+
+
+def _words(text):
+    return [w for w in _re.findall(r"[a-z0-9]+", (text or "").lower()) if len(w) > 1]
+
+
+def _flat_search(prefix, query, n):
+    cmd = ["yt-dlp", f"{prefix}{n}:{query}", "--flat-playlist", "--dump-json",
+           "--no-warnings", "--ignore-errors", "--playlist-end", str(n)]
+    if prefix == "ytsearch":
+        cmd += [*cookie_args(), *YTDLP_POT_ARGS, *JS_RUNTIME_ARGS]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception:
+        return []
+    out = []
+    for line in r.stdout.splitlines():
+        try:
+            out.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass
+    return out
+
+
+def _pick_soundcloud(query):
+    qw = set(_words(query))
+    ql = query.lower()
+    for e in _flat_search("scsearch", query, 5):
+        url = e.get("webpage_url") or e.get("original_url") or e.get("url")
+        dur = e.get("duration")
+        title = e.get("title") or ""
+        if not url or dur is None or not (90 <= dur <= 600):
+            continue
+        have = set(_words(title + " " + (e.get("uploader") or "")))
+        if qw and len(qw & have) / len(qw) < 0.6:
+            continue
+        tl = title.lower()
+        if any(_re.search(r"\\b" + _re.escape(b) + r"\\b", tl) and b not in ql
+               for b in _BAD_WORDS):
+            continue
+        return url
+    return None
+
+
+def _pick_youtube(query):
+    for e in _flat_search("ytsearch", query, 1):
+        url = e.get("webpage_url") or e.get("url")
+        if not url and e.get("id"):
+            url = "https://www.youtube.com/watch?v=" + e["id"]
+        if url:
+            return url
+    return None
+
+
+def _parts(resp):
+    if isinstance(resp, tuple):
+        return resp[0], resp[1]
+    return resp, resp.status_code
+
+
+@app.route("/extract/smart", methods=["POST"])
+def extract_smart():
+    if not check_auth(request):
+        return jsonify({"error": "unauthorized"}), 401
+    data = request.get_json(silent=True) or {}
+    query = str(data.get("query") or "").strip()
+    if not query:
+        return jsonify({"error": "missing 'query'"}), 400
+    if not EXTRACT_SLOTS.acquire(timeout=120):
+        return jsonify({"error": "server busy, try again shortly"}), 429
+    try:
+        base = {"mode": "audio",
+                "quality": data.get("quality", "medium"),
+                "audio_format": data.get("audio_format", "m4a"),
+                "enhance": data.get("enhance", False)}
+        sc = _pick_soundcloud(query)
+        if sc:
+            r, code = _parts(_extract_work({**base, "url": sc}))
+            if code == 200:
+                body = r.get_json()
+                body["source"] = "soundcloud"
+                body["matched_url"] = sc
+                return jsonify(body)
+        yt = _pick_youtube(query)
+        if not yt:
+            return jsonify({"error": "no results found for that query"}), 404
+        r, code = _parts(_extract_work({**base, "url": yt}))
+        if code == 200:
+            body = r.get_json()
+            body["source"] = "youtube"
+            body["matched_url"] = yt
+            return jsonify(body)
+        return r, code
     finally:
         EXTRACT_SLOTS.release()
 
