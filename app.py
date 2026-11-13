@@ -382,10 +382,12 @@ def extract():
 
 
 import re as _re
+import time as _time
 
 _BAD_WORDS = ("remix", "sped up", "speed up", "slowed", "nightcore", "cover",
               "mashup", "bass boosted", "8d", "reverb", "karaoke",
-              "instrumental", "live")
+              "instrumental", "live", "edit", "tiktok", "tik tok",
+              "chopped", "screwed", "lofi")
 
 
 def _words(text):
@@ -410,40 +412,70 @@ def _flat_search(prefix, query, n):
     return out
 
 
-def _pick_soundcloud(query):
+def _pick_soundcloud(query, trace):
+    t0 = _time.time()
+    entries = _flat_search("scsearch", query, 5)
+    trace.append({"stage": "sc_search", "sec": round(_time.time() - t0, 1),
+                  "results": len(entries)})
     qw = set(_words(query))
     ql = query.lower()
-    for e in _flat_search("scsearch", query, 5):
+    rejects = []
+    for e in entries:
         url = e.get("webpage_url") or e.get("original_url") or e.get("url")
         dur = e.get("duration")
         title = e.get("title") or ""
-        if not url or dur is None or not (90 <= dur <= 600):
+        if not url or dur is None:
+            rejects.append(title[:50] + " | no url/duration")
+            continue
+        if not (90 <= dur <= 600):
+            rejects.append(title[:50] + " | duration " + str(dur))
             continue
         have = set(_words(title + " " + (e.get("uploader") or "")))
         if qw and len(qw & have) / len(qw) < 0.6:
+            rejects.append(title[:50] + " | title match")
             continue
         tl = title.lower()
-        if any(_re.search(r"\\b" + _re.escape(b) + r"\\b", tl) and b not in ql
-               for b in _BAD_WORDS):
+        bad = next((b for b in _BAD_WORDS
+                    if _re.search(r"\b" + _re.escape(b) + r"\b", tl) and b not in ql), None)
+        if bad:
+            rejects.append(title[:50] + " | bad word: " + bad)
             continue
+        trace.append({"stage": "sc_pick", "picked": title[:60]})
         return url
+    trace.append({"stage": "sc_pick", "picked": None, "rejected": rejects})
     return None
 
 
-def _pick_youtube(query):
+def _pick_youtube(query, trace):
+    t0 = _time.time()
+    url = None
     for e in _flat_search("ytsearch", query, 1):
         url = e.get("webpage_url") or e.get("url")
         if not url and e.get("id"):
             url = "https://www.youtube.com/watch?v=" + e["id"]
         if url:
-            return url
-    return None
+            break
+    trace.append({"stage": "yt_search", "sec": round(_time.time() - t0, 1),
+                  "found": bool(url)})
+    return url
 
 
 def _parts(resp):
     if isinstance(resp, tuple):
         return resp[0], resp[1]
     return resp, resp.status_code
+
+
+def _timed_extract(base, url, label, trace):
+    t0 = _time.time()
+    r, code = _parts(_extract_work({**base, "url": url}))
+    entry = {"stage": label, "sec": round(_time.time() - t0, 1), "http": code}
+    if code != 200:
+        err = r.get_json(silent=True) or {}
+        entry["error"] = str(err.get("error"))
+        entry["stderr"] = str(err.get("stderr", ""))[-300:]
+    trace.append(entry)
+    return r, code
 
 
 @app.route("/extract/smart", methods=["POST"])
@@ -456,29 +488,37 @@ def extract_smart():
         return jsonify({"error": "missing 'query'"}), 400
     if not EXTRACT_SLOTS.acquire(blocking=False):
         return jsonify({"error": "server busy, try again shortly"}), 429
+    trace = []
     try:
         base = {"mode": "audio",
                 "quality": data.get("quality", "medium"),
                 "audio_format": data.get("audio_format", "m4a"),
                 "enhance": data.get("enhance", False)}
-        sc = _pick_soundcloud(query)
+        sc = _pick_soundcloud(query, trace)
         if sc:
-            r, code = _parts(_extract_work({**base, "url": sc}))
+            r, code = _timed_extract(base, sc, "sc_extract", trace)
             if code == 200:
                 body = r.get_json()
                 body["source"] = "soundcloud"
                 body["matched_url"] = sc
+                body["trace"] = trace
+                print("[smart]", trace)
                 return jsonify(body)
-        yt = _pick_youtube(query)
+        yt = _pick_youtube(query, trace)
         if not yt:
-            return jsonify({"error": "no results found for that query"}), 404
-        r, code = _parts(_extract_work({**base, "url": yt}))
+            print("[smart]", trace)
+            return jsonify({"error": "no results found for that query", "trace": trace}), 404
+        r, code = _timed_extract(base, yt, "yt_extract", trace)
+        print("[smart]", trace)
         if code == 200:
             body = r.get_json()
             body["source"] = "youtube"
             body["matched_url"] = yt
+            body["trace"] = trace
             return jsonify(body)
-        return r, code
+        err = r.get_json(silent=True) or {}
+        err["trace"] = trace
+        return jsonify(err), code
     finally:
         EXTRACT_SLOTS.release()
 
