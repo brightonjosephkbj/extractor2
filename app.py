@@ -373,7 +373,7 @@ def _extract_work(data=None):
 def extract():
     if not check_auth(request):
         return jsonify({"error": "unauthorized"}), 401
-    if not EXTRACT_SLOTS.acquire(timeout=60):
+    if not EXTRACT_SLOTS.acquire(blocking=False):
         return jsonify({"error": "server busy, try again shortly"}), 429
     try:
         return _extract_work()
@@ -454,7 +454,7 @@ def extract_smart():
     query = str(data.get("query") or "").strip()
     if not query:
         return jsonify({"error": "missing 'query'"}), 400
-    if not EXTRACT_SLOTS.acquire(timeout=120):
+    if not EXTRACT_SLOTS.acquire(blocking=False):
         return jsonify({"error": "server busy, try again shortly"}), 429
     try:
         base = {"mode": "audio",
