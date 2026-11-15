@@ -278,18 +278,7 @@ def _extract_work(data=None):
     info_json_path = os.path.join(work_dir, "output.info.json")
 
     audio_format = (data.get("audio_format") or "m4a").lower()
-    if mode == "audio" and audio_format == "mp3":
-        bitrate = AUDIO_QUALITY_MAP.get(quality, "192")
-        cmd = [
-            "yt-dlp", "-x", "--audio-format", "mp3",
-            *cookie_args(work_dir), *YTDLP_POT_ARGS, *JS_RUNTIME_ARGS,
-            "--audio-quality", bitrate + "K",
-            "--write-info-json", "-o", out_template, url,
-        ]
-        expected_path = os.path.join(work_dir, "output.mp3")
-        mimetype = "audio/mpeg"
-        download_ext = "mp3"
-    elif mode == "audio":
+    if mode == "audio":
         cmd = [
             "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio",
             *cookie_args(work_dir), *YTDLP_POT_ARGS, *JS_RUNTIME_ARGS,
@@ -332,6 +321,23 @@ def _extract_work(data=None):
 
     if not expected_path or not os.path.exists(expected_path):
         return jsonify({"error": f"extraction succeeded but {download_ext} not found"}), 500
+
+    if mode == "audio" and download_ext in ("opus", "webm", "ogg"):
+        mp3_path = os.path.join(work_dir, "converted.mp3")
+        try:
+            br = str(AUDIO_QUALITY_MAP.get(quality, "192"))
+            conv = subprocess.run(
+                ["ffmpeg", "-y", "-i", expected_path, "-vn",
+                 "-c:a", "libmp3lame", "-b:a", br + "k", mp3_path],
+                capture_output=True, text=True, timeout=180)
+            if conv.returncode == 0 and os.path.exists(mp3_path):
+                expected_path = mp3_path
+                download_ext = "mp3"
+                mimetype = "audio/mpeg"
+            else:
+                print(f"[extract] opus->mp3 failed, sending original: {conv.stderr[-300:]}")
+        except subprocess.TimeoutExpired:
+            print("[extract] opus->mp3 timed out, sending original")
 
     if data.get("enhance"):
         enhanced_path = os.path.join(work_dir, f"enhanced.{download_ext}")
